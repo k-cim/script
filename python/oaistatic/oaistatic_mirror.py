@@ -1,154 +1,152 @@
 # === File: oaistatic_mirror.py
-# Version: 1.3.0
-# Date: 2025-07-27 16:10:00 UTC
-# Description: Importe les ressources Firefox (_fichiers), centralise les fichiers, remplace les chemins locaux, logue par fichier avec timestamp. Conformité Git-ready.
+# Version: 1.3.1
+# Date: 2025-07-27 20:04:52 UTC
+# Description: Analyse et traitement des ressources HTML locales issues de Firefox.
+#              Détection automatique du dossier *_fichiers associé, mise en cache unifiée des assets,
+#              remplacement des chemins par des liens relatifs, gestion de logs détaillés.
+#              Conçu pour automatiser l'intégration et la visualisation offline de contenus web.
 
+import argparse
 import os
 import sys
+import re
 import hashlib
-import requests
-import argparse
-from bs4 import BeautifulSoup
-from urllib.parse import urlparse
-from datetime import datetime
 import shutil
+from pathlib import Path
+from bs4 import BeautifulSoup
+from datetime import datetime
 
-DEFAULT_REPOSIT = os.path.expanduser("~/Dev/documentation")
+# Répertoire racine par défaut
+DEFAULT_REPO = os.path.expanduser("~/Dev/documentation/oaistatic")
+
+# Initialisation des chemins relatifs
 CDN_DIR = "cdn"
 PERSISTENT_DIR = "persistent"
-LOG_SUBDIR = ".log"
-HTML_SUBDIR = "html"
-FIREFOX_IMPORT_DIR = "firefox_imports"
+EXTERNAL_DIR = "external_assets"
+LOG_DIRNAME = "_log"
+HTML_DIRNAME = "html"
 
-VALID_DOMAINS = {
-    "cdn.oaistatic.com": CDN_DIR,
-    "persistent.oaistatic.com": PERSISTENT_DIR
-}
-
-HASH_FUNC = hashlib.md5
-VERBOSE = False
-DRY_RUN = False
-ALLOW_MISSING_DIR = False
-MANUAL_FIREFOX_DIR = None
+# Extensions de fichiers à rechercher
+ASSET_EXTENSIONS = [".js", ".css", ".png", ".jpg", ".jpeg", ".webp", ".gif", ".mp4", ".mov"]
 
 
-def compute_hash(file_path):
-    h = HASH_FUNC()
-    with open(file_path, 'rb') as f:
-        h.update(f.read())
-    return h.hexdigest()
+def compute_md5(file_path):
+    hash_md5 = hashlib.md5()
+    with open(file_path, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
 
-def prepare_directories(base_dir):
-    oaistatic_dir = os.path.join(base_dir, "oaistatic")
-    if not os.path.exists(oaistatic_dir):
-        print(f"Le répertoire {oaistatic_dir} n'existe pas.")
+
+def ensure_directories(base_path):
+    for d in [CDN_DIR, PERSISTENT_DIR, EXTERNAL_DIR, HTML_DIRNAME, LOG_DIRNAME]:
+        path = os.path.join(base_path, d)
+        os.makedirs(path, exist_ok=True)
+
+
+def detect_firefox_dir(input_html):
+    base = Path(input_html)
+    folder_candidate = base.parent / f"{base.stem}_fichiers"
+    return folder_candidate if folder_candidate.exists() else None
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Mirror HTML resources locally for oaistatic.com and persistent.oaistatic.com")
+    parser.add_argument("input_html", help="HTML file to process")
+    parser.add_argument("output_html", nargs="?", help="Modified HTML output file")
+    parser.add_argument("--repo", default=DEFAULT_REPO, help="Target root repository (default: ~/Dev/documentation/oaistatic)")
+    parser.add_argument("--force-no-dir", action="store_true", help="Bypass automatic *_fichiers directory detection")
+    return parser.parse_args()
+
+
+def mirror_assets(soup, base_dir, html_name, firefox_assets):
+    log_entries = []
+    lines = Path(html_name).read_text(encoding="utf-8").splitlines()
+    replaced_files = {}
+    
+    for tag in soup.find_all(["script", "link", "img"]):
+        attr = "src" if tag.name != "link" else "href"
+        url = tag.get(attr)
+        if not url:
+            continue
+
+        if url.startswith("https://cdn.oaistatic.com/"):
+            relative_path = url.replace("https://cdn.oaistatic.com/", "")
+            out_dir = os.path.join(base_dir, CDN_DIR, os.path.dirname(relative_path))
+        elif url.startswith("https://persistent.oaistatic.com/"):
+            relative_path = url.replace("https://persistent.oaistatic.com/", "")
+            out_dir = os.path.join(base_dir, PERSISTENT_DIR, os.path.dirname(relative_path))
+        elif firefox_assets:
+            filename = Path(url).name
+            local_file = next(f for f in firefox_assets.rglob(filename) if f.name == filename) if filename else None
+            if local_file and local_file.exists():
+                file_hash = compute_md5(local_file)
+                new_name = f"{filename}"
+                dest = os.path.join(base_dir, EXTERNAL_DIR, new_name)
+                if os.path.exists(dest) and compute_md5(dest) != file_hash:
+                    dest = os.path.join(base_dir, EXTERNAL_DIR, f"{file_hash}_{filename}")
+                shutil.copy2(local_file, dest)
+                tag[attr] = f"../{EXTERNAL_DIR}/{os.path.basename(dest)}"
+                continue
+            else:
+                continue
+        else:
+            continue
+
+        os.makedirs(out_dir, exist_ok=True)
+        dest_file = os.path.join(out_dir, os.path.basename(relative_path))
+
+        if not os.path.exists(dest_file):
+            try:
+                import requests
+                r = requests.get(url)
+                r.raise_for_status()
+                with open(dest_file, "wb") as f:
+                    f.write(r.content)
+            except Exception as e:
+                log_entries.append(f"ERREUR : {url} => {e}")
+                continue
+
+        tag[attr] = os.path.relpath(dest_file, os.path.join(base_dir, HTML_DIRNAME))
+
+    return log_entries
+
+
+def main():
+    args = parse_args()
+
+    input_html = args.input_html
+    output_html = args.output_html or str(Path(input_html).with_name(f"{Path(input_html).stem}-mod.html"))
+    base_dir = os.path.abspath(args.repo)
+    ensure_directories(base_dir)
+    firefox_assets = None if args.force_no_dir else detect_firefox_dir(input_html)
+
+    if not Path(input_html).exists():
+        print(f"Fichier introuvable : {input_html}")
         sys.exit(1)
 
-    for sub in [CDN_DIR, PERSISTENT_DIR, LOG_SUBDIR, HTML_SUBDIR, FIREFOX_IMPORT_DIR]:
-        os.makedirs(os.path.join(oaistatic_dir, sub), exist_ok=True)
-    return oaistatic_dir
-
-def guess_firefox_folder(input_file):
-    base = os.path.basename(input_file)
-    if base.endswith(".html"):
-        stem = base[:-5].replace(".", "_")
-        return os.path.join(os.path.dirname(input_file), f"{stem}_fichiers")
-    return input_file + "_fichiers"
-
-def extract_firefox_folder(input_file):
-    candidate = MANUAL_FIREFOX_DIR or guess_firefox_folder(input_file)
-    if os.path.exists(candidate):
-        return candidate
-    if ALLOW_MISSING_DIR:
-        return None
-    choice = input(f"⚠️ Dossier Firefox '{candidate}' introuvable. Continuer sans ? (y/n) ").strip().lower()
-    if choice != 'y':
+    if not Path(base_dir).exists():
+        print(f"Dossier cible inexistant : {base_dir}")
         sys.exit(1)
-    return None
 
-def import_firefox_files(source_dir, dest_dir, log_lines):
-    if not source_dir:
-        return
-    for root, _, files in os.walk(source_dir):
-        for file in files:
-            src = os.path.join(root, file)
-            rel_path = os.path.relpath(src, source_dir)
-            dest = os.path.join(dest_dir, rel_path)
-            os.makedirs(os.path.dirname(dest), exist_ok=True)
-            if not os.path.exists(dest):
-                shutil.copy2(src, dest)
-                log_lines.append(f"FICHIER IMPORTÉ : {rel_path}")
+    with open(input_html, "r", encoding="utf-8") as f:
+        soup = BeautifulSoup(f, "html.parser")
 
-def rewrite_html_paths(soup, firefox_src_dir, firefox_dest_rel, log_lines):
-    for tag in soup.find_all(True):
-        for attr in ['src', 'href']:
-            if tag.has_attr(attr):
-                val = tag[attr]
-                if firefox_src_dir and val.startswith(os.path.basename(firefox_src_dir) + "/"):
-                    rel_path = val.split("/", 1)[-1]
-                    new_path = f"oaistatic/{firefox_dest_rel}/{rel_path}"
-                    tag[attr] = new_path
-                    log_lines.append(f"CHEMIN RÉÉCRIT : {val} → {new_path}")
+    log_entries = mirror_assets(soup, base_dir, input_html, firefox_assets)
 
-def generate_logfile(log_dir, output_html):
-    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
-    base = os.path.basename(output_html).replace(".html", "")
-    return os.path.join(log_dir, f"{base}.{ts}.Log")
+    out_path = os.path.join(base_dir, HTML_DIRNAME, Path(output_html).name)
+    log_name = f"{Path(output_html).stem}.{datetime.now().strftime('%Y%m%dT%H%M%S')}.log"
+    log_path = os.path.join(base_dir, LOG_DIRNAME, log_name)
 
-def process(input_file, base_dir):
-    oaistatic_dir = prepare_directories(base_dir)
-    firefox_src = extract_firefox_folder(input_file)
-    firefox_dest_rel = os.path.join(FIREFOX_IMPORT_DIR, os.path.splitext(os.path.basename(input_file))[0])
-    firefox_dest = os.path.join(oaistatic_dir, firefox_dest_rel)
-
-    output_html = os.path.join(oaistatic_dir, HTML_SUBDIR, os.path.basename(input_file).replace(".html", "-mod.html"))
-    log_file = generate_logfile(os.path.join(oaistatic_dir, LOG_SUBDIR), output_html)
-
-    log_lines = []
-    import_firefox_files(firefox_src, firefox_dest, log_lines)
-
-    with open(input_file, 'r', encoding='utf-8') as f:
-        soup = BeautifulSoup(f, 'html.parser')
-
-    rewrite_html_paths(soup, firefox_src, firefox_dest_rel, log_lines)
-
-    with open(output_html, 'w', encoding='utf-8') as f:
+    with open(out_path, "w", encoding="utf-8") as f:
         f.write(str(soup))
 
-    with open(log_file, 'w', encoding='utf-8') as log:
-        for line in log_lines:
-            log.write(line + "\n")
+    with open(log_path, "w", encoding="utf-8") as log:
+        for entry in log_entries:
+            log.write(entry + "\n")
 
-    print(f"✅ HTML modifié : {output_html}\n🪵 Log : {log_file}")
+    print(f"\n✅ HTML modifié : {out_path}\n🪵 Log : {log_path}")
 
-def show_help():
-    print("""Usage : oaistatic_mirror.py [-r repo] [--firefox-dir chemin/] [--allow-missing-dir] fichier.html
 
-Version : 1.3.0
-Date    : 2025-07-27 16:10:00 UTC
-But     : Importer et réécrire les fichiers Firefox pour centralisation et Git
-Options :
-  -r DIR                   Répertoire racine cible (par défaut : ~/Dev/documentation)
-  --firefox-dir PATH       Spécifie manuellement le dossier *_fichiers/ de Firefox
-  --allow-missing-dir      Continue même si le dossier *_fichiers est manquant
-  -h, --help               Affiche cette aide
-""")
-
-if __name__ == '__main__':
-    parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument('-r', dest='repo_path', default=DEFAULT_REPOSIT)
-    parser.add_argument('--firefox-dir', dest='manual_firefox_dir', default=None)
-    parser.add_argument('--allow-missing-dir', action='store_true')
-    parser.add_argument('input_html', nargs='?')
-    parser.add_argument('-h', '--help', action='store_true')
-    args = parser.parse_args()
-
-    ALLOW_MISSING_DIR = args.allow_missing_dir
-    MANUAL_FIREFOX_DIR = args.manual_firefox_dir
-
-    if args.help or not args.input_html:
-        show_help()
-        sys.exit(0)
-
-    REPOSIT = os.path.abspath(os.path.expanduser(args.repo_path))
-    process(args.input_html, REPOSIT)
+if __name__ == "__main__":
+    main()
