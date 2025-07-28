@@ -1,21 +1,21 @@
 #!/usr/bin/python3
 # === File: oaistatic_mirror.py
-# Version: 1.3.3
-# Date: 2025-07-28 15:20:00 UTC
-# Description: Transforme un HTML avec dépendances locales Firefox en HTML propre, liens relatifs, dépendances vérifiées, MD5, ASCII-safe.
-# Conforms to SBSRATE modular structure + CLI compatibility
+# Version: 1.3.4
+# Date: 2025-07-28 18:42:00 UTC
+# Description: Transforme les liens HTML dépendants des fichiers Firefox/CDN en chemins locaux. Supporte md5, logs, assets multiples.
 
 import os
 import sys
-import argparse
 import hashlib
 import shutil
+import argparse
 import re
-from pathlib import Path
+import unicodedata
 from datetime import datetime
+from pathlib import Path
 from bs4 import BeautifulSoup
 
-# 📁 Répertoires cibles (bientôt dans oaistatic.json)
+# === Répertoires par défaut
 OAISTATIC_BASE = Path.home() / "Dev/documentation/oaistatic"
 HTML_DIR = OAISTATIC_BASE / "html"
 LOG_DIR = OAISTATIC_BASE / "_log"
@@ -23,112 +23,134 @@ CDN_DIR = OAISTATIC_BASE / "cdn/assets"
 PERSISTENT_DIR = OAISTATIC_BASE / "persistent"
 EXTERNAL_DIR = OAISTATIC_BASE / "external_assets"
 
-# 🔧 Fonctions utilitaires
-def slugify(name):
-    # Supprime accents, majuscules, caractères spéciaux
-    name = name.lower()
-    name = re.sub(r'[éèêë]', 'e', name)
-    name = re.sub(r'[àâä]', 'a', name)
-    name = re.sub(r'[îï]', 'i', name)
-    name = re.sub(r'[ôö]', 'o', name)
-    name = re.sub(r'[ùûü]', 'u', name)
-    name = re.sub(r'[^a-z0-9_.-]', '_', name)
-    return name
+def slugify_filename(name):
+    nfkd = unicodedata.normalize('NFKD', name)
+    ascii_name = nfkd.encode('ASCII', 'ignore').decode('ascii')
+    ascii_name = ascii_name.lower()
+    ascii_name = ascii_name.replace('ç', 'c').replace('æ', 'ae').replace('œ', 'oe')
+    return re.sub(r'[^a-zA-Z0-9._-]', '_', ascii_name)
 
-def md5sum(filepath):
-    h = hashlib.md5()
-    with open(filepath, 'rb') as f:
-        for chunk in iter(lambda: f.read(8192), b''):
-            h.update(chunk)
-    return h.hexdigest()
+def compute_md5(path):
+    hash_md5 = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
 
-def copy_with_md5(src, dst_dir):
-    dst_dir.mkdir(parents=True, exist_ok=True)
-    filename = slugify(src.name)
-    dst = dst_dir / filename
-    if dst.exists() and md5sum(dst) == md5sum(src):
-        return dst
-    shutil.copy2(src, dst)
-    return dst
+def copy_with_md5(source_path, dest_path):
+    if dest_path.exists() and compute_md5(source_path) == compute_md5(dest_path):
+        return False  # Aucun changement
+    shutil.copy2(source_path, dest_path)
+    return True
 
-# 🔁 Traitement principal
-def process_html(input_html, assets_dir, verbose=False, silent=False, to_stdout=False):
-    input_path = Path(input_html).resolve()
-    soup = BeautifulSoup(input_path.read_text(encoding="utf-8"), 'html.parser')
+def mirror_assets(soup, base_dir, input_path, firefox_dir):
+    tags = soup.find_all(['link', 'script', 'img', 'source'])
+    log_entries = []
+    timestamp = datetime.utcnow().isoformat()
+    for idx, tag in enumerate(tags):
+        attr = 'href' if tag.name in ['link'] else 'src'
+        url = tag.get(attr)
+        if not url:
+            continue
 
-    assets_dir = Path(assets_dir) if assets_dir else input_path.with_name(input_path.stem + "_fichiers")
-    if not assets_dir.exists():
-        if not silent:
-            print(f"📁 Dossier Firefox non trouvé : {assets_dir}. Continuer ? (y/n)", end=' ')
-            if input() != 'y':
-                return
+        # CDN
+        if 'cdn.oaistatic.com/assets/' in url:
+            filename = url.split('/')[-1]
+            local_path = CDN_DIR / filename
+            tag[attr] = os.path.relpath(local_path, HTML_DIR)
+            log_entries.append((timestamp, input_path.name, url, tag[attr], 'cdn'))
+            continue
 
-    timestamp = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
-    logs = []
+        # Persistent
+        if 'persistent.oaistatic.com/' in url:
+            subpath = url.split('persistent.oaistatic.com/')[-1]
+            local_path = PERSISTENT_DIR / subpath
+            tag[attr] = os.path.relpath(local_path, HTML_DIR)
+            log_entries.append((timestamp, input_path.name, url, tag[attr], 'persistent'))
+            continue
 
-    for tag in soup.find_all(src=True) + soup.find_all(href=True):
-        attr = "src" if tag.has_attr("src") else "href"
-        val = tag[attr]
+        # Firefox assets (_fichiers)
+        if firefox_dir:
+            url_path = Path(url)
+            try:
+                candidate = next(f for f in firefox_dir.rglob(url_path.name) if f.name == url_path.name)
+            except StopIteration:
+                continue
 
-        if val.startswith("https://cdn.oaistatic.com/assets/"):
-            fname = Path(val).name
-            new = f"../cdn/assets/{fname}"
-            tag[attr] = new
-            logs.append((val, new, "cdn"))
-        elif val.startswith("https://persistent.oaistatic.com/"):
-            subpath = val.split("persistent.oaistatic.com/")[1]
-            new = f"../persistent/{subpath}"
-            tag[attr] = new
-            logs.append((val, new, "persistent"))
-        elif assets_dir and (assets_dir / Path(val).name).exists():
-            src_file = next((p for p in assets_dir.rglob(Path(val).name)), None)
-            if src_file:
-                new_path = copy_with_md5(src_file, EXTERNAL_DIR)
-                tag[attr] = f"../external_assets/{new_path.name}"
-                ext = new_path.suffix.lower().lstrip('.')
-                logs.append((val, str(tag[attr]), ext))
+            clean_name = slugify_filename(candidate.name)
+            dest_path = EXTERNAL_DIR / clean_name
+            if copy_with_md5(candidate, dest_path):
+                log_entries.append((timestamp, input_path.name, str(candidate), str(dest_path), candidate.suffix[1:]))
 
-    out_file = HTML_DIR / (slugify(input_path.stem) + "-mod.html")
-    out_file.write_text(str(soup), encoding="utf-8")
+            tag[attr] = os.path.relpath(dest_path, HTML_DIR)
 
-    if not silent and not to_stdout:
-        print(f"✅ HTML modifié : {out_file}")
+    # Patcher les import ES6 : import * as X from "https://cdn.oaistatic.com/assets/xxx.js"
+    for script in soup.find_all('script'):
+        if script.string:
+            pattern = r'import\s+\*\s+as\s+(\w+)\s+from\s+[\'"](https://cdn\.oaistatic\.com/assets/[^\'"]+)[\'"];'
+            matches = re.findall(pattern, script.string)
+            for varname, fullurl in matches:
+                filename = fullurl.split('/')[-1]
+                local_path = CDN_DIR / filename
+                replacement = f'import * as {varname} from "{os.path.relpath(local_path, HTML_DIR)}";'
+                script.string = re.sub(
+                    re.escape(f'import * as {varname} from "{fullurl}";'),
+                    replacement,
+                    script.string
+                )
+                log_entries.append((timestamp, input_path.name, fullurl, str(local_path), 'es6'))
 
-    log_path = LOG_DIR / f"{timestamp}.{slugify(input_path.name)}.log"
-    log_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(log_path, "w", encoding="utf-8") as logf:
-        for url, new, kind in logs:
-            line = f"{datetime.utcnow().isoformat()} ; {input_path.name} ; {url} ; {new} ; {kind}"
-            logf.write(line + "\n")
+    return log_entries
 
-    if not silent and not to_stdout:
-        print(f"🪵 Log : {log_path}")
+def write_log(log_entries, name):
+    log_name = datetime.utcnow().strftime("%Y%m%dT%H%M%S") + f".{name}.log"
+    LOG_DIR.mkdir(parents=True, exist_ok=True)
+    with open(LOG_DIR / log_name, 'w') as f:
+        for entry in log_entries:
+            f.write(" ; ".join(entry) + "\n")
 
-    if to_stdout:
-        print(str(soup))
-
-# 🚀 Entrée principale
 def main():
-    parser = argparse.ArgumentParser(description="Transforme un HTML Firefox en version locale propre avec dépendances relatives.")
-    parser.add_argument("html_file", nargs="?", help="Fichier HTML source à nettoyer.")
-    parser.add_argument("--assets-dir", help="Répertoire contenant les fichiers liés (Firefox).")
-    parser.add_argument("--verbose", action="store_true", help="Affiche les opérations détaillées.")
-    parser.add_argument("--silent", action="store_true", help="Aucune sortie texte.")
-    parser.add_argument("--stdin", action="store_true", help="Lecture depuis l'entrée standard.")
-    parser.add_argument("--stdout", action="store_true", help="Écriture vers la sortie standard.")
-
+    parser = argparse.ArgumentParser(description="Convertit les ressources HTML en chemins locaux.")
+    parser.add_argument("input", help="Fichier HTML source")
+    parser.add_argument("--assets-dir", help="Nom du répertoire _fichiers si différent")
+    parser.add_argument("--silent", action="store_true", help="Mode silence total")
+    parser.add_argument("--verbose", action="store_true", help="Affiche les opérations")
     args = parser.parse_args()
 
-    if args.stdin:
-        html = sys.stdin.read()
-        tmp = Path("/tmp/stdin_input.html")
-        tmp.write_text(html, encoding="utf-8")
-        process_html(tmp, args.assets_dir, verbose=args.verbose, silent=args.silent, to_stdout=args.stdout)
+    input_path = Path(args.input)
+    if not input_path.exists():
+        print(f"❌ Fichier HTML introuvable : {input_path}")
+        sys.exit(1)
+
+    # Firefox folder associé
+    base_name = input_path.stem
+    if args.assets_dir:
+        firefox_dir = Path(args.assets_dir)
     else:
-        if not args.html_file:
-            print("❌ Fichier HTML requis sauf en mode --stdin.")
-            return
-        process_html(args.html_file, args.assets_dir, verbose=args.verbose, silent=args.silent, to_stdout=args.stdout)
+        firefox_dir = input_path.parent / f"{base_name}_fichiers"
+
+    if not firefox_dir.exists():
+        if not args.silent:
+            resp = input(f"📁 Dossier Firefox non trouvé : {firefox_dir}. Continuer ? (y/n) ")
+            if resp.strip().lower() != 'y':
+                sys.exit(1)
+        firefox_dir = None
+
+    with open(input_path, "r", encoding="utf-8") as f:
+        soup = BeautifulSoup(f, "html.parser")
+
+    HTML_DIR.mkdir(parents=True, exist_ok=True)
+    output_path = HTML_DIR / f"{base_name}-mod.html"
+
+    log_entries = mirror_assets(soup, OAISTATIC_BASE, input_path, firefox_dir)
+    write_log(log_entries, input_path.name)
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write(str(soup))
+
+    if not args.silent:
+        print(f"✅ HTML modifié : {output_path}")
+        print(f"🪵 Log : {LOG_DIR / (datetime.utcnow().strftime('%Y%m%dT%H%M%S') + f'.{input_path.name}.log')}")
 
 if __name__ == "__main__":
     main()
