@@ -1,9 +1,9 @@
 #!/usr/bin/python3
 # === File: oaistatic_mirror.py
-# Version: 1.3.8
-# Date: 2025-07-28 22:59:00 UTC
-# Description: HTML localizer for ChatGPT-exported pages. Rewrites external and local asset links, copies files, generates detailed log.
-# Conforms to SBSRATE modular structure – CLI friendly
+# Version: 1.3.9
+# Date: 2025-07-28 23:30:00 UTC
+# Description: HTML localizer with asset separation (cdn, persistent, local). Rewrites links, copies assets, logs origin.
+# Conforms to SBSRATE modular structure – DEV ONLY
 
 import os
 import re
@@ -16,11 +16,13 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 # === Configuration ===
-VERSION = "1.3.8"
+VERSION = "1.3.9"
 OAISTATIC_BASE = Path.home() / "Dev/documentation/oaistatic"
 HTML_DIR = OAISTATIC_BASE / "html"
 LOG_DIR = OAISTATIC_BASE / "_log"
 EXTERNAL_DIR = OAISTATIC_BASE / "external_assets"
+CDN_DIR = OAISTATIC_BASE / "cdn/assets"
+PERSISTENT_DIR = OAISTATIC_BASE / "persistent"
 EXTENSIONS = [".js", ".css", ".svg", ".webp", ".png", ".jpg", ".jpeg", ".gif", ".mp4", ".mov", ".ico"]
 
 # === Slugify ===
@@ -61,18 +63,20 @@ def process_html(input_path, args):
     with open(input_path, "r", encoding="utf-8") as f:
         html = f.read()
 
-    # === Réécriture des liens cdn.oaistatic.com ===
+    # === Réécriture CDN ===
     cdn_matches = set(re.findall(r'https://cdn\.oaistatic\.com/assets/[^"\'\s)><]+', html))
     cdn_matches.update(re.findall(r'import\(["\'](https://cdn\.oaistatic\.com/assets/[^"\')]+)["\']\)', html))
 
     for url in sorted(cdn_matches):
         filename = url.split("/")[-1]
-        dest_path = EXTERNAL_DIR / filename
+        dest_path = CDN_DIR / filename
         local_source = assets_dir / filename
         type_ = filename.split(".")[-1]
 
+        # Copy si trouvé en local
         if local_source.exists():
             if not dest_path.exists() or md5sum(local_source) != md5sum(dest_path):
+                CDN_DIR.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(local_source, dest_path)
                 statut = "copié"
             else:
@@ -82,10 +86,34 @@ def process_html(input_path, args):
             statut = "réécrit – distant (non trouvé localement)"
             source_str = url
 
-        html = html.replace(url, f"../external_assets/{filename}")
-        log_entries.append(f"{datetime.utcnow().isoformat()} ; {original_name} ; {source_str} ; ../external_assets/{filename} ; {type_} ; {statut}")
+        html = html.replace(url, f"../cdn/assets/{filename}")
+        log_entries.append(f"{datetime.utcnow().isoformat()} ; {original_name} ; {source_str} ; ../cdn/assets/{filename} ; {type_} ; {statut} ; origine: cdn")
 
-    # === Réécriture des liens locaux (_fichiers/) ===
+    # === Réécriture Persistent ===
+    persistent_matches = set(re.findall(r'https://persistent\.oaistatic\.com/[^"\'\s)><]+', html))
+
+    for url in sorted(persistent_matches):
+        rel_path = url.split("persistent.oaistatic.com/")[-1]
+        dest_path = PERSISTENT_DIR / rel_path
+        local_source = assets_dir / Path(rel_path).name
+        type_ = rel_path.split(".")[-1]
+
+        if local_source.exists():
+            if not dest_path.exists() or md5sum(local_source) != md5sum(dest_path):
+                dest_path.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(local_source, dest_path)
+                statut = "copié"
+            else:
+                statut = "identique – déjà présent"
+            source_str = str(local_source)
+        else:
+            statut = "réécrit – distant (non trouvé localement)"
+            source_str = url
+
+        html = html.replace(url, f"../persistent/{rel_path}")
+        log_entries.append(f"{datetime.utcnow().isoformat()} ; {original_name} ; {source_str} ; ../persistent/{rel_path} ; {type_} ; {statut} ; origine: persistent")
+
+    # === Réécriture des liens locaux (_fichiers) ===
     local_matches = re.findall(rf'(["\'(]){re.escape(assets_dir.name)}/([^"\'\s)><]+)', html)
 
     for prefix, filename in sorted(set(local_matches)):
@@ -99,6 +127,7 @@ def process_html(input_path, args):
 
         if local_source.exists():
             if not dest_path.exists() or md5sum(local_source) != md5sum(dest_path):
+                EXTERNAL_DIR.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(local_source, dest_path)
                 statut = "copié"
             else:
@@ -106,9 +135,9 @@ def process_html(input_path, args):
         else:
             statut = "introuvable – réécrit quand même"
 
-        log_entries.append(f"{datetime.utcnow().isoformat()} ; {original_name} ; {src} ; {dest} ; {type_} ; {statut}")
+        log_entries.append(f"{datetime.utcnow().isoformat()} ; {original_name} ; {src} ; {dest} ; {type_} ; {statut} ; origine: local")
 
-    # === Écriture du HTML modifié ===
+    # === Sauvegarde HTML modifié ===
     HTML_DIR.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(html)
@@ -116,7 +145,7 @@ def process_html(input_path, args):
     if not args.silent:
         print(f"✅ HTML modifié : {output_path}")
 
-    # === Log structuré ===
+    # === Log ===
     if not args.no_log:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         log_file = LOG_DIR / f"{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}.{input_path.name}.log"
