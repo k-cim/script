@@ -1,8 +1,8 @@
 #!/usr/bin/python3
 # === File: oaistatic_mirror.py
-# Version: 1.3.7
-# Date: 2025-07-28 22:41:00 UTC
-# Description: HTML localizer for ChatGPT-exported pages. Rewrites external links, copies assets, generates structured log.
+# Version: 1.3.8
+# Date: 2025-07-28 22:59:00 UTC
+# Description: HTML localizer for ChatGPT-exported pages. Rewrites external and local asset links, copies files, generates detailed log.
 # Conforms to SBSRATE modular structure – CLI friendly
 
 import os
@@ -16,7 +16,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 # === Configuration ===
-VERSION = "1.3.7"
+VERSION = "1.3.8"
 OAISTATIC_BASE = Path.home() / "Dev/documentation/oaistatic"
 HTML_DIR = OAISTATIC_BASE / "html"
 LOG_DIR = OAISTATIC_BASE / "_log"
@@ -61,18 +61,16 @@ def process_html(input_path, args):
     with open(input_path, "r", encoding="utf-8") as f:
         html = f.read()
 
-    # Match toutes les URLs https externes à réécrire
-    all_matches = set(re.findall(r'https://cdn\.oaistatic\.com/assets/[^"\'\s)><]+', html))
-    all_matches.update(re.findall(r'import\(["\'](https://cdn\.oaistatic\.com/assets/[^"\')]+)["\']\)', html))
+    # === Réécriture des liens cdn.oaistatic.com ===
+    cdn_matches = set(re.findall(r'https://cdn\.oaistatic\.com/assets/[^"\'\s)><]+', html))
+    cdn_matches.update(re.findall(r'import\(["\'](https://cdn\.oaistatic\.com/assets/[^"\')]+)["\']\)', html))
 
-    for url in sorted(all_matches):
+    for url in sorted(cdn_matches):
         filename = url.split("/")[-1]
         dest_path = EXTERNAL_DIR / filename
         local_source = assets_dir / filename
         type_ = filename.split(".")[-1]
-        statut = ""
 
-        # Copie conditionnelle si fichier trouvé localement
         if local_source.exists():
             if not dest_path.exists() or md5sum(local_source) != md5sum(dest_path):
                 shutil.copy2(local_source, dest_path)
@@ -84,13 +82,33 @@ def process_html(input_path, args):
             statut = "réécrit – distant (non trouvé localement)"
             source_str = url
 
-        # Réécriture dans HTML
         html = html.replace(url, f"../external_assets/{filename}")
-
-        # Log
         log_entries.append(f"{datetime.utcnow().isoformat()} ; {original_name} ; {source_str} ; ../external_assets/{filename} ; {type_} ; {statut}")
 
-    # Écriture du HTML modifié
+    # === Réécriture des liens locaux (_fichiers/) ===
+    local_matches = re.findall(rf'(["\'(]){re.escape(assets_dir.name)}/([^"\'\s)><]+)', html)
+
+    for prefix, filename in sorted(set(local_matches)):
+        src = f"{assets_dir.name}/{filename}"
+        dest = f"../external_assets/{filename}"
+        dest_path = EXTERNAL_DIR / filename
+        local_source = assets_dir / filename
+        type_ = filename.split(".")[-1]
+
+        html = html.replace(src, dest)
+
+        if local_source.exists():
+            if not dest_path.exists() or md5sum(local_source) != md5sum(dest_path):
+                shutil.copy2(local_source, dest_path)
+                statut = "copié"
+            else:
+                statut = "identique – déjà présent"
+        else:
+            statut = "introuvable – réécrit quand même"
+
+        log_entries.append(f"{datetime.utcnow().isoformat()} ; {original_name} ; {src} ; {dest} ; {type_} ; {statut}")
+
+    # === Écriture du HTML modifié ===
     HTML_DIR.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(html)
@@ -98,7 +116,7 @@ def process_html(input_path, args):
     if not args.silent:
         print(f"✅ HTML modifié : {output_path}")
 
-    # Log final
+    # === Log structuré ===
     if not args.no_log:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         log_file = LOG_DIR / f"{datetime.utcnow().strftime('%Y%m%dT%H%M%S')}.{input_path.name}.log"
